@@ -20,6 +20,7 @@ package ringhash_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -78,6 +79,15 @@ const (
 	virtualHostName = "test.server"
 )
 
+// fastConnectParams can be used to speed up tests that rely on subchannel to move
+// to transient failure, since it disables the backoff.
+var fastConnectParams = grpc.ConnectParams{
+	Backoff: backoff.Config{
+		BaseDelay: 10 * time.Millisecond,
+	},
+	MinConnectTimeout: 10 * time.Millisecond,
+}
+
 // Tests the case where the ring contains a single subConn, and verifies that
 // when the server goes down, the LB policy on the client automatically
 // reconnects until the subChannel moves out of TRANSIENT_FAILURE.
@@ -103,6 +113,7 @@ func (s) TestRingHash_ReconnectToMoveOutOfTransientFailure(t *testing.T) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithResolvers(r),
 		grpc.WithDefaultServiceConfig(ringHashServiceConfig),
+		grpc.WithConnectParams(fastConnectParams),
 	}
 	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
@@ -520,12 +531,12 @@ func (s) TestRingHash_AggregateClusterFallBackFromRingHashToLogicalDnsAtStartupN
 		},
 		MinConnectTimeout: 0,
 	}
-	opts := []grpc.DialOption{
+	dopts := []grpc.DialOption{
 		grpc.WithResolvers(xdsResolver),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer.DialContext),
 		grpc.WithConnectParams(cp)}
-	conn, err := grpc.NewClient("xds:///test.server", opts...)
+	conn, err := grpc.NewClient("xds:///test.server", dopts...)
 	if err != nil {
 		t.Fatalf("Failed to create client: %s", err)
 	}
@@ -1439,12 +1450,12 @@ func (s) TestRingHash_ContinuesConnectingWithoutPicks(t *testing.T) {
 	}
 
 	dialer := testutils.NewBlockingDialer()
-	dialOpts := []grpc.DialOption{
+	dopts := []grpc.DialOption{
 		grpc.WithResolvers(xdsResolver),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer.DialContext),
 	}
-	conn, err := grpc.NewClient("xds:///test.server", dialOpts...)
+	conn, err := grpc.NewClient("xds:///test.server", dopts...)
 	if err != nil {
 		t.Fatalf("Failed to create client: %s", err)
 	}
@@ -1615,5 +1626,483 @@ func (s) TestRingHash_ReattemptWhenGoingFromTransientFailureToIdle(t *testing.T)
 	}
 	if got, want := conn.GetState(), connectivity.Ready; got != want {
 		t.Errorf("conn.GetState(): got %v, want %v", got, want)
+	}
+}
+
+// Tests that when all backends are down and then up, we may pick a TF backend
+// and we will then jump to ready backend.
+func (s) TestRingHash_TransientFailureSkipToAvailableReady(t *testing.T) {
+	emptyCallF := func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		return &testpb.Empty{}, nil
+	}
+	lis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	restartableListener1 := testutils.NewRestartableListener(lis)
+	restartableServer1 := stubserver.StartTestService(t, &stubserver.StubServer{
+		Listener:   restartableListener1,
+		EmptyCallF: emptyCallF,
+	})
+	defer restartableServer1.Stop()
+
+	lis, err = testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	restartableListener2 := testutils.NewRestartableListener(lis)
+	restartableServer2 := stubserver.StartTestService(t, &stubserver.StubServer{
+		Listener:   restartableListener2,
+		EmptyCallF: emptyCallF,
+	})
+	defer restartableServer2.Stop()
+
+	nonExistantBackends := makeNonExistentBackends(t, 2)
+
+	host, _, err := net.SplitHostPort(restartableServer1.Address)
+	if err != nil {
+		t.Fatalf("Failed to split host and port from stubserver: %v", err)
+	}
+	const clusterName = "cluster"
+	backends := []string{restartableServer1.Address, restartableServer2.Address}
+	backends = append(backends, nonExistantBackends...)
+	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
+		ClusterName: clusterName,
+		Host:        host,
+		Localities: []e2e.LocalityOptions{{
+			Backends: backendOptions(t, backends),
+			Weight:   1,
+		}}})
+	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
+		ClusterName: clusterName,
+		ServiceName: clusterName,
+		Policy:      e2e.LoadBalancingPolicyRingHash,
+	})
+	route := headerHashRoute("new_route", virtualHostName, clusterName, "address_hash")
+	listener := e2e.DefaultClientListener(virtualHostName, route.Name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	xdsServer, nodeID, xdsResolver := setupManagementServerAndResolver(t)
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
+		t.Fatalf("Failed to update xDS resources: %v", err)
+	}
+	opts := []grpc.DialOption{
+		grpc.WithConnectParams(grpc.ConnectParams{
+			// Disable backoff to speed up the test.
+			MinConnectTimeout: 100 * time.Millisecond,
+		}),
+		grpc.WithResolvers(xdsResolver),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+	conn, err := grpc.NewClient("xds:///test.server", opts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %s", err)
+	}
+	defer conn.Close()
+	client := testgrpc.NewTestServiceClient(conn)
+
+	if got, want := conn.GetState(), connectivity.Idle; got != want {
+		t.Errorf("conn.GetState(): got %v, want %v", got, want)
+	}
+
+	// Test starts with backends not listening.
+	restartableListener1.Stop()
+	restartableListener2.Stop()
+
+	// Send a request with a hash that should go to restartableServer1.
+	// Because it is not accepting connections, and no other backend is
+	// listening, the RPC fails.
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("address_hash", restartableServer1.Address+"_0"))
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+	if err == nil {
+		t.Errorf("rpc EmptyCall() succeeded, want error")
+	}
+
+	if got, want := conn.GetState(), connectivity.TransientFailure; got != want {
+		t.Errorf("conn.GetState(): got %v, want %v", got, want)
+	}
+
+	// Bring up first backend. The channel should become Ready without any
+	// picks, because in TF, we are always trying to connect to at least one
+	// backend at all times.
+	restartableListener1.Restart()
+	testutils.AwaitState(ctx, t, conn, connectivity.Ready)
+
+	// Bring down backend 1 and bring up backend 2.
+	// Note the RPC contains a header value that will always be hashed to
+	// backend 1. So by purposely bringing down backend 1 and bringing up
+	// another backend, this will ensure Picker's first choice of backend 1
+	// fails and it will go through the remaining subchannels to find one in
+	// READY. Since the entries in the ring are pretty distributed and we have
+	// unused ports to fill the ring, it is almost guaranteed that the Picker
+	// will go through some non-READY entries and skip them as per design.
+	t.Logf("bringing down backend 1")
+	restartableListener1.Stop()
+
+	testutils.AwaitState(ctx, t, conn, connectivity.TransientFailure)
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+	if err == nil {
+		t.Errorf("rpc EmptyCall() succeeded, want error")
+	}
+
+	t.Logf("bringing up backend 2")
+	restartableListener2.Restart()
+	testutils.AwaitState(ctx, t, conn, connectivity.Ready)
+
+	peerAddr := ""
+	for peerAddr != restartableServer2.Address {
+		p := peer.Peer{}
+		_, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&p))
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Timed out waiting for rpc EmptyCall() to be routed to the expected backend")
+		}
+		peerAddr = p.Addr.String()
+	}
+}
+
+// Tests that when all backends are down, we keep reattempting.
+func (s) TestRingHash_ReattemptWhenAllEndpointsUnreachable(t *testing.T) {
+	lis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	restartableListener := testutils.NewRestartableListener(lis)
+	restartableServer := stubserver.StartTestService(t, &stubserver.StubServer{
+		Listener: restartableListener,
+		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
+		},
+	})
+	defer restartableServer.Stop()
+
+	host, _, err := net.SplitHostPort(restartableServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to split host and port from stubserver: %v", err)
+	}
+
+	const clusterName = "cluster"
+	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
+		ClusterName: clusterName,
+		Host:        host,
+		Localities: []e2e.LocalityOptions{{
+			Backends: backendOptions(t, []string{restartableServer.Address}),
+			Weight:   1,
+		}}})
+	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
+		ClusterName: clusterName,
+		ServiceName: clusterName,
+		Policy:      e2e.LoadBalancingPolicyRingHash,
+	})
+	route := headerHashRoute("new_route", virtualHostName, clusterName, "address_hash")
+	listener := e2e.DefaultClientListener(virtualHostName, route.Name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	xdsServer, nodeID, xdsResolver := setupManagementServerAndResolver(t)
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
+		t.Fatalf("Failed to update xDS resources: %v", err)
+	}
+
+	dopts := []grpc.DialOption{
+		grpc.WithResolvers(xdsResolver),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(fastConnectParams),
+	}
+	conn, err := grpc.NewClient("xds:///test.server", dopts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %s", err)
+	}
+	defer conn.Close()
+	client := testgrpc.NewTestServiceClient(conn)
+
+	if got, want := conn.GetState(), connectivity.Idle; got != want {
+		t.Errorf("conn.GetState(): got %v, want %v", got, want)
+	}
+
+	t.Log("Stopping the backend server")
+	restartableListener.Stop()
+
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+	if err == nil || status.Code(err) != codes.Unavailable {
+		t.Errorf("rpc EmptyCall() succeeded, want Unavailable error")
+	}
+
+	// Wait for channel to fail.
+	testutils.AwaitState(ctx, t, conn, connectivity.TransientFailure)
+
+	t.Log("Restarting the backend server")
+	restartableListener.Restart()
+
+	// Wait for channel to become connected without any pending RPC.
+	testutils.AwaitState(ctx, t, conn, connectivity.Ready)
+}
+
+func (s) TestRingHash_SwitchToLowerPriorityAndThenBack(t *testing.T) {
+	lis, err := testutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	restartableListener := testutils.NewRestartableListener(lis)
+	restartableServer := stubserver.StartTestService(t, &stubserver.StubServer{
+		Listener: restartableListener,
+		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
+		},
+	})
+	defer restartableServer.Stop()
+
+	otherBackend := startTestServiceBackends(t, 1)[0]
+
+	// We must set the host name socket address in EDS, as the ring hash policy
+	// uses it to construct the ring.
+	host, _, err := net.SplitHostPort(otherBackend)
+	if err != nil {
+		t.Fatalf("Failed to split host and port from stubserver: %v", err)
+	}
+
+	const clusterName = "cluster"
+	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
+		ClusterName: clusterName,
+		Host:        host,
+		Localities: []e2e.LocalityOptions{{
+			Backends: backendOptions(t, []string{restartableServer.Address}),
+			Weight:   1,
+		}, {
+			Backends: backendOptions(t, []string{otherBackend}),
+			Weight:   1,
+			Priority: 1,
+		}}})
+	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
+		ClusterName: clusterName,
+		ServiceName: clusterName,
+		Policy:      e2e.LoadBalancingPolicyRingHash,
+	})
+	route := headerHashRoute("new_route", virtualHostName, clusterName, "address_hash")
+	listener := e2e.DefaultClientListener(virtualHostName, route.Name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	xdsServer, nodeID, xdsResolver := setupManagementServerAndResolver(t)
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
+		t.Fatalf("Failed to update xDS resources: %v", err)
+	}
+
+	dopts := []grpc.DialOption{
+		grpc.WithResolvers(xdsResolver),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(fastConnectParams),
+	}
+	conn, err := grpc.NewClient("xds:///test.server", dopts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %s", err)
+	}
+	defer conn.Close()
+	client := testgrpc.NewTestServiceClient(conn)
+
+	// Note each type of RPC contains a header value that will always be hashed
+	// to the value that was used to place the non-existent endpoint on the ring.
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("address_hash", restartableServer.Address+"_0"))
+	var got string
+	for got = range checkRPCSendOK(ctx, t, client, 1) {
+	}
+	if want := restartableServer.Address; got != want {
+		t.Errorf("Got RPC routed to addr %v, want %v", got, want)
+	}
+
+	// Trigger failure with the existing backend, which should cause the
+	// balancer to go in transient failure and the priority balancer to move
+	// to the lower priority.
+	restartableListener.Stop()
+
+	for {
+		p := peer.Peer{}
+		_, err = client.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true), grpc.Peer(&p))
+
+		// Ignore errors: we may need to attempt to send an RPC to detect the
+		// failure (the next write on connection fails).
+		if err == nil {
+			if got, want := p.Addr.String(), otherBackend; got != want {
+				t.Errorf("Got RPC routed to addr %v, want %v", got, want)
+			}
+			break
+		}
+	}
+
+	// Now we start the backend with the address hash that is used in the
+	// metadata, so eventually RPCs should be routed to it, since it is in a
+	// locality with higher priority.
+	peerAddr := ""
+	restartableListener.Restart()
+	for peerAddr != restartableServer.Address {
+		p := peer.Peer{}
+		_, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&p))
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Timed out waiting for rpc EmptyCall() to be routed to the expected backend")
+		}
+		peerAddr = p.Addr.String()
+	}
+}
+
+// Tests that when we trigger internal connection attempts without picks, we do
+// so for only one subchannel at a time.
+func (s) TestRingHash_ContinuesConnectingWithoutPicksOneSubchannelAtATime(t *testing.T) {
+	backends := startTestServiceBackends(t, 1)
+	nonExistantBackends := makeNonExistentBackends(t, 3)
+
+	// We must set the host name socket address in EDS, as the ring hash policy
+	// uses it to construct the ring.
+	host, _, err := net.SplitHostPort(backends[0])
+	if err != nil {
+		t.Fatalf("Failed to split host and port from stubserver: %v", err)
+	}
+
+	const clusterName = "cluster"
+
+	backendOpts := append(backendOptions(t, nonExistantBackends), backendOptions(t, backends)...)
+	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
+		ClusterName: clusterName,
+		Host:        host,
+		Localities: []e2e.LocalityOptions{{
+			Backends: backendOpts,
+			Weight:   1,
+		}},
+	})
+	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
+		ClusterName: clusterName,
+		ServiceName: clusterName,
+		Policy:      e2e.LoadBalancingPolicyRingHash,
+	})
+	route := headerHashRoute("new_route", virtualHostName, clusterName, "address_hash")
+	listener := e2e.DefaultClientListener(virtualHostName, route.Name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	xdsServer, nodeID, xdsResolver := setupManagementServerAndResolver(t)
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
+		t.Fatalf("Failed to update xDS resources: %v", err)
+	}
+
+	dialer := testutils.NewBlockingDialer()
+	dialOpts := []grpc.DialOption{
+		grpc.WithResolvers(xdsResolver),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(dialer.DialContext),
+		grpc.WithConnectParams(fastConnectParams),
+	}
+	conn, err := grpc.NewClient("xds:///test.server", dialOpts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %s", err)
+	}
+	defer conn.Close()
+	client := testgrpc.NewTestServiceClient(conn)
+
+	holdNonExistant0 := dialer.Hold(nonExistantBackends[0])
+	holdNonExistant1 := dialer.Hold(nonExistantBackends[1])
+	holdNonExistant2 := dialer.Hold(nonExistantBackends[2])
+	holdGood := dialer.Hold(backends[0])
+
+	rpcCtx, rpcCancel := context.WithCancel(ctx)
+	go func() {
+		rpcCtx = metadata.NewOutgoingContext(rpcCtx, metadata.Pairs("address_hash", nonExistantBackends[0]+"_0")) // XXX
+		_, err := client.EmptyCall(rpcCtx, &testpb.Empty{})
+		if status.Code(err) != codes.Canceled {
+			t.Errorf("Expected RPC to be canceled, got error: %v", err)
+		}
+	}()
+
+	// Wait for the RPC to trigger a connection attempt to the first address,
+	// then cancel the RPC.  No other connection attempts should be started yet.
+	if !holdNonExistant0.Wait(ctx) {
+		t.Fatalf("Timeout waiting for connection attempt to backend 0")
+	}
+	rpcCancel()
+
+	// Allow the connection attempt to the first address to resume and wait for
+	// the attempt for the second address.  No other connection attempts should
+	// be started yet.
+	if holdNonExistant1.IsStarted() {
+		t.Errorf("Got connection attempt to backend 1, expected no connection attempt.")
+	}
+	if holdNonExistant2.IsStarted() {
+		t.Errorf("Got connection attempt to backend 2, expected no connection attempt.")
+	}
+	if holdGood.IsStarted() {
+		t.Errorf("Got connection attempt to good backend, expected no connection attempt.")
+	}
+
+	// Allow the connection attempt to the first address to resume and wait for
+	// the attempt for the second address. No other connection attempts should
+	// be started yet.
+	holdNonExistant0Again := dialer.Hold(nonExistantBackends[0])
+	holdNonExistant0.Resume()
+	if !holdNonExistant1.Wait(ctx) {
+		t.Fatalf("Timeout waiting for connection attempt to backend 1")
+	}
+	if holdNonExistant0Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 0 again, expected no connection attempt.")
+	}
+	if holdNonExistant2.IsStarted() {
+		t.Errorf("Got connection attempt to backend 2, expected no connection attempt.")
+	}
+	if holdGood.IsStarted() {
+		t.Errorf("Got connection attempt to good backend, expected no connection attempt.")
+	}
+
+	// Allow the connection attempt to the second address to resume and wait for
+	// the attempt for the third address.  No other connection attempts should
+	// be started yet.
+	holdNonExistant1Again := dialer.Hold(nonExistantBackends[1])
+	holdNonExistant1.Resume()
+	if !holdNonExistant2.Wait(ctx) {
+		t.Fatalf("Timeout waiting for connection attempt to backend 2")
+	}
+	if holdNonExistant0Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 0 again, expected no connection attempt.")
+	}
+	if holdNonExistant1Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 1 again, expected no connection attempt.")
+	}
+	if holdGood.IsStarted() {
+		t.Errorf("Got connection attempt to good backend, expected no connection attempt.")
+	}
+
+	// Allow the connection attempt to the third address to resume and wait
+	// for the attempt for the final address. No other connection attempts
+	// should be started yet.
+	holdNonExistant2Again := dialer.Hold(nonExistantBackends[2])
+	holdNonExistant2.Resume()
+	if !holdGood.Wait(ctx) {
+		t.Fatalf("Timeout waiting for connection attempt to good backend")
+	}
+	if holdNonExistant0Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 0 again, expected no connection attempt.")
+	}
+	if holdNonExistant1Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 1 again, expected no connection attempt.")
+	}
+	if holdNonExistant2Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 2 again, expected no connection attempt.")
+	}
+
+	// Allow the final attempt to resume.
+	holdGood.Resume()
+
+	// Wait for channel to become connected without any pending RPC.
+	testutils.AwaitState(ctx, t, conn, connectivity.Ready)
+
+	// No other connection attempts should have been started
+	if holdNonExistant0Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 0 again, expected no connection attempt.")
+	}
+	if holdNonExistant1Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 1 again, expected no connection attempt.")
+	}
+	if holdNonExistant2Again.IsStarted() {
+		t.Errorf("Got connection attempt to backend 2 again, expected no connection attempt.")
 	}
 }
