@@ -79,8 +79,8 @@ const (
 	virtualHostName = "test.server"
 )
 
-// fastConnectParams can be used to speed up tests that rely on subchannel to move
-// to transient failure, since it disables the backoff.
+// fastConnectParams disables connection attempts backoffs and lowers delays.
+// This speeds up tests that rely on subchannel to move to transient failure.
 var fastConnectParams = grpc.ConnectParams{
 	Backoff: backoff.Config{
 		BaseDelay: 10 * time.Millisecond,
@@ -633,13 +633,7 @@ func (s) TestRingHash_ChannelIdHashing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
-	if err := xdsServer.Update(ctx, e2e.UpdateOptions{
-		NodeID:    nodeID,
-		Endpoints: []*v3endpointpb.ClusterLoadAssignment{endpoints},
-		Clusters:  []*v3clusterpb.Cluster{cluster},
-		Routes:    []*v3routepb.RouteConfiguration{route},
-		Listeners: []*v3listenerpb.Listener{listener},
-	}); err != nil {
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
 		t.Fatalf("Failed to update xDS resources: %v", err)
 	}
 
@@ -699,13 +693,7 @@ func (s) TestRingHash_HeaderHashing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 
-	if err := xdsServer.Update(ctx, e2e.UpdateOptions{
-		NodeID:    nodeID,
-		Endpoints: []*v3endpointpb.ClusterLoadAssignment{endpoints},
-		Clusters:  []*v3clusterpb.Cluster{cluster},
-		Routes:    []*v3routepb.RouteConfiguration{route},
-		Listeners: []*v3listenerpb.Listener{listener},
-	}); err != nil {
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
 		t.Fatalf("Failed to update xDS resources: %v", err)
 	}
 
@@ -734,22 +722,8 @@ func (s) TestRingHash_HeaderHashing(t *testing.T) {
 func (s) TestRingHash_HeaderHashingWithRegexRewrite(t *testing.T) {
 	backends := startTestServiceBackends(t, 4)
 
-	// We must set the host name socket address in EDS, as the ring hash policy
-	// uses it to construct the ring.
-	host, _, err := net.SplitHostPort(backends[0])
-	if err != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err)
-	}
-
 	clusterName := "cluster"
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: backendOptions(t, backends),
-			Weight:   1,
-		}},
-	})
+	endpoints := endpointResource(t, clusterName, backends)
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
@@ -770,13 +744,7 @@ func (s) TestRingHash_HeaderHashingWithRegexRewrite(t *testing.T) {
 	defer cancel()
 
 	xdsServer, nodeID, xdsResolver := setupManagementServerAndResolver(t)
-	if err := xdsServer.Update(ctx, e2e.UpdateOptions{
-		NodeID:    nodeID,
-		Endpoints: []*v3endpointpb.ClusterLoadAssignment{endpoints},
-		Clusters:  []*v3clusterpb.Cluster{cluster},
-		Routes:    []*v3routepb.RouteConfiguration{route},
-		Listeners: []*v3listenerpb.Listener{listener},
-	}); err != nil {
+	if err := xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
 		t.Fatalf("Failed to update xDS resources: %v", err)
 	}
 
@@ -956,8 +924,8 @@ func (s) TestRingHash_EndpointWeights(t *testing.T) {
 	}
 }
 
-// Tests that ring hash policy evaluation will continue past the terminal policy
-// if no results are produced yet.
+// Tests that ring hash policy evaluation will continue past the terminal hash
+// policy if no results are produced yet.
 func (s) TestRingHash_ContinuesPastTerminalPolicyThatDoesNotProduceResult(t *testing.T) {
 	backends := startTestServiceBackends(t, 2)
 
@@ -971,7 +939,7 @@ func (s) TestRingHash_ContinuesPastTerminalPolicyThatDoesNotProduceResult(t *tes
 
 	route := e2e.DefaultRouteConfig("new_route", "test.server", clusterName)
 
-	// Even though this policy is terminal, since it produces no result, we
+	// Even though this hash policy is terminal, since it produces no result, we
 	// continue past it to find a policy that produces results.
 	hashPolicy := v3routepb.RouteAction_HashPolicy{
 		PolicySpecifier: &v3routepb.RouteAction_HashPolicy_Header_{
@@ -979,8 +947,8 @@ func (s) TestRingHash_ContinuesPastTerminalPolicyThatDoesNotProduceResult(t *tes
 				HeaderName: "header_not_present",
 			},
 		},
+		Terminal: true,
 	}
-	hashPolicy.Terminal = true
 	hashPolicy2 := v3routepb.RouteAction_HashPolicy{
 		PolicySpecifier: &v3routepb.RouteAction_HashPolicy_Header_{
 			Header: &v3routepb.RouteAction_HashPolicy_Header{
@@ -1008,10 +976,14 @@ func (s) TestRingHash_ContinuesPastTerminalPolicyThatDoesNotProduceResult(t *tes
 	defer conn.Close()
 	client := testgrpc.NewTestServiceClient(conn)
 
-	// Note that the first policy does not match, and in the second hash policy,
-	// each type of RPC contains a header value that always hashes to a specific
-	// backend, as the header value matches the value used to create the entry
-	// in the ring.
+	// - The first hash policy does not match because the header is not present.
+	//   If this hash policy was applied, it would spread the load across
+	//   backend 0 and 1, since a random hash would be used.
+	// - In the second hash policy, each type of RPC contains a header
+	//   value that always hashes to backend 0, as the header value
+	//   matches the value used to create the entry in the ring.
+	// We verify that the second hash policy is used by checking that all RPCs
+	// are being routed to backend 0.
 	wantBackend := backends[0]
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("address_hash", wantBackend+"_0"))
 	const numRPCs = 100
@@ -1021,8 +993,8 @@ func (s) TestRingHash_ContinuesPastTerminalPolicyThatDoesNotProduceResult(t *tes
 	}
 }
 
-// Tests that a random hash is used when header hashing specified a header field
-// that the RPC did not have.
+// Tests that a random hash is used when header hashing policy specified a
+// header field that the RPC did not have.
 func (s) TestRingHash_HashOnHeaderThatIsNotPresent(t *testing.T) {
 	backends := startTestServiceBackends(t, 2)
 	wantFractionPerBackend := .5
@@ -1059,7 +1031,10 @@ func (s) TestRingHash_HashOnHeaderThatIsNotPresent(t *testing.T) {
 	defer conn.Close()
 	client := testgrpc.NewTestServiceClient(conn)
 
-	// Send a large number of RPCs and check that they are distributed randomly.
+	// The first hash policy does not apply because the header is not present in
+	// the RPCs that we are about to send. As a result, a random hash should be
+	// used instead, resulting in a random request distribution.
+	// We verify this by checking that the RPCs are distributed randomly.
 	gotPerBackend := checkRPCSendOK(ctx, t, client, numRPCs)
 	for _, backend := range backends {
 		got := float64(gotPerBackend[backend]) / float64(numRPCs)
@@ -1124,7 +1099,9 @@ func (s) TestRingHash_UnsupportedHashPolicyDefaultToRandomHashing(t *testing.T) 
 	defer conn.Close()
 	client := testgrpc.NewTestServiceClient(conn)
 
-	// Send a large number of RPCs and check that they are distributed randomly.
+	// Since none of the hash policy are supported, a random hash should be
+	// generated for every request.
+	// We verify this by checking that the RPCs are distributed randomly.
 	gotPerBackend := checkRPCSendOK(ctx, t, client, numRPCs)
 	for _, backend := range backends {
 		got := float64(gotPerBackend[backend]) / float64(numRPCs)
@@ -1135,7 +1112,7 @@ func (s) TestRingHash_UnsupportedHashPolicyDefaultToRandomHashing(t *testing.T) 
 }
 
 // Tests that unsupported hash policy types are all ignored before a supported
-// policy.
+// hash policy.
 func (s) TestRingHash_UnsupportedHashPolicyUntilChannelIdHashing(t *testing.T) {
 	backends := startTestServiceBackends(t, 2)
 
@@ -1194,8 +1171,9 @@ func (s) TestRingHash_UnsupportedHashPolicyUntilChannelIdHashing(t *testing.T) {
 	defer conn.Close()
 	client := testgrpc.NewTestServiceClient(conn)
 
-	// Since this is using the channel ID hashing policy, all requests should
-	// be routed to the same backend.
+	// Since only unsupported policies are present except for the last one
+	// which is using the channel ID hashing policy, all requests should be
+	// routed to the same backend.
 	const numRPCs = 100
 	gotPerBackend := checkRPCSendOK(ctx, t, client, numRPCs)
 	if len(gotPerBackend) != 1 {
@@ -1294,8 +1272,6 @@ func (s) TestRingHash_FixedHashingTerminalPolicy(t *testing.T) {
 
 	route := e2e.DefaultRouteConfig("new_route", "test.server", clusterName)
 
-	// Even though this policy is terminal, since it produces no result, we
-	// continue past it to find a policy that produces results.
 	hashPolicy := v3routepb.RouteAction_HashPolicy{
 		PolicySpecifier: &v3routepb.RouteAction_HashPolicy_Header_{
 			Header: &v3routepb.RouteAction_HashPolicy_Header{
@@ -1332,8 +1308,8 @@ func (s) TestRingHash_FixedHashingTerminalPolicy(t *testing.T) {
 	client := testgrpc.NewTestServiceClient(conn)
 
 	// Check that despite the matching random string header, since the fixed
-	// string hash policy is terminal, requests all get routed to the same
-	// host.
+	// string hash policy is terminal, only the fixed string hash policy applies
+	// and requests all get routed to the same host.
 	gotPerBackend := make(map[string]int)
 	const numRPCs = 100
 	for i := 0; i < numRPCs; i++ {
@@ -1415,24 +1391,7 @@ func (s) TestRingHash_ContinuesConnectingWithoutPicks(t *testing.T) {
 	nonExistantServerAddr := makeNonExistentBackends(t, 1)[0]
 
 	const clusterName = "cluster"
-
-	// We must set the host name socket address in EDS, as the ring hash policy
-	// uses it to construct the ring.
-	host, _, err2 := net.SplitHostPort(backend.Address)
-	if err2 != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err2)
-	}
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: []e2e.BackendOptions{
-				{Port: testutils.ParsePort(t, backend.Address)},
-				{Port: testutils.ParsePort(t, nonExistantServerAddr)},
-			},
-			Weight: 1,
-		}},
-	})
+	endpoints := endpointResource(t, clusterName, []string{backend.Address, nonExistantServerAddr})
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
@@ -1485,36 +1444,17 @@ func (s) TestRingHash_ContinuesConnectingWithoutPicks(t *testing.T) {
 	// succeeding, despite no new RPC being sent.
 	hold.Resume()
 
-	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
-		if !conn.WaitForStateChange(ctx, state) {
-			t.Errorf("Timeout waiting for the conn to become ready.")
-			break
-		}
-	}
+	testutils.AwaitState(ctx, t, conn, connectivity.Ready)
 }
 
 // Tests that when the first pick is down leading to a transient failure, we
 // will move on to the next ring hash entry.
 func (s) TestRingHash_TransientFailureCheckNextOne(t *testing.T) {
 	backends := startTestServiceBackends(t, 1)
-
-	// We must set the host name socket address in EDS, as the ring hash policy
-	// uses it to construct the ring.
-	host, _, err := net.SplitHostPort(backends[0])
-	if err != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err)
-	}
 	nonExistentBackends := makeNonExistentBackends(t, 1)
 
 	const clusterName = "cluster"
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: backendOptions(t, append(nonExistentBackends, backends...)),
-			Weight:   1,
-		}},
-	})
+	endpoints := endpointResource(t, clusterName, append(nonExistentBackends, backends...))
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
@@ -1590,8 +1530,7 @@ func (s) TestRingHash_ReattemptWhenGoingFromTransientFailureToIdle(t *testing.T)
 
 	// There are no endpoints in EDS. RPCs should fail and the channel should
 	// transition to transient failure.
-	_, err = client.EmptyCall(ctx, &testpb.Empty{})
-	if err == nil || status.Code(err) != codes.Unavailable {
+	if _, err = client.EmptyCall(ctx, &testpb.Empty{}); err == nil {
 		t.Errorf("rpc EmptyCall() succeeded, want error")
 	}
 	if got, want := conn.GetState(), connectivity.TransientFailure; got != want {
@@ -1608,20 +1547,12 @@ func (s) TestRingHash_ReattemptWhenGoingFromTransientFailureToIdle(t *testing.T)
 			Weight:   1,
 		}},
 	})
-	err = xdsServer.Update(ctx, e2e.UpdateOptions{
-		NodeID:    nodeID,
-		Endpoints: []*v3endpointpb.ClusterLoadAssignment{endpoints},
-		Clusters:  []*v3clusterpb.Cluster{cluster},
-		Routes:    []*v3routepb.RouteConfiguration{route},
-		Listeners: []*v3listenerpb.Listener{listener},
-	})
-	if err != nil {
+	if err = xdsServer.Update(ctx, xdsUpdateOpts(nodeID, endpoints, cluster, route, listener)); err != nil {
 		t.Fatalf("Failed to update xDS resources: %v", err)
 	}
 
 	// A WaitForReady RPC should succeed, and the channel should report READY.
-	_, err = client.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true))
-	if err != nil {
+	if _, err = client.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
 		t.Errorf("rpc EmptyCall() failed: %v", err)
 	}
 	if got, want := conn.GetState(), connectivity.Ready; got != want {
@@ -1659,20 +1590,10 @@ func (s) TestRingHash_TransientFailureSkipToAvailableReady(t *testing.T) {
 
 	nonExistantBackends := makeNonExistentBackends(t, 2)
 
-	host, _, err := net.SplitHostPort(restartableServer1.Address)
-	if err != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err)
-	}
 	const clusterName = "cluster"
 	backends := []string{restartableServer1.Address, restartableServer2.Address}
 	backends = append(backends, nonExistantBackends...)
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: backendOptions(t, backends),
-			Weight:   1,
-		}}})
+	endpoints := endpointResource(t, clusterName, backends)
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
@@ -1777,19 +1698,8 @@ func (s) TestRingHash_ReattemptWhenAllEndpointsUnreachable(t *testing.T) {
 	})
 	defer restartableServer.Stop()
 
-	host, _, err := net.SplitHostPort(restartableServer.Address)
-	if err != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err)
-	}
-
 	const clusterName = "cluster"
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: backendOptions(t, []string{restartableServer.Address}),
-			Weight:   1,
-		}}})
+	endpoints := endpointResource(t, clusterName, []string{restartableServer.Address})
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
@@ -1953,24 +1863,9 @@ func (s) TestRingHash_ContinuesConnectingWithoutPicksOneSubchannelAtATime(t *tes
 	backends := startTestServiceBackends(t, 1)
 	nonExistantBackends := makeNonExistentBackends(t, 3)
 
-	// We must set the host name socket address in EDS, as the ring hash policy
-	// uses it to construct the ring.
-	host, _, err := net.SplitHostPort(backends[0])
-	if err != nil {
-		t.Fatalf("Failed to split host and port from stubserver: %v", err)
-	}
-
 	const clusterName = "cluster"
 
-	backendOpts := append(backendOptions(t, nonExistantBackends), backendOptions(t, backends)...)
-	endpoints := e2e.EndpointResourceWithOptions(e2e.EndpointOptions{
-		ClusterName: clusterName,
-		Host:        host,
-		Localities: []e2e.LocalityOptions{{
-			Backends: backendOpts,
-			Weight:   1,
-		}},
-	})
+	endpoints := endpointResource(t, clusterName, append(nonExistantBackends, backends...))
 	cluster := e2e.ClusterResourceWithOptions(e2e.ClusterOptions{
 		ClusterName: clusterName,
 		ServiceName: clusterName,
