@@ -59,6 +59,8 @@ import (
 // atomically.
 var clientConnectionCounter uint64
 
+var goAwayLoopyWriterTimeout = 5 * time.Second
+
 var metadataFromOutgoingContextRaw = internal.FromOutgoingContextRaw.(func(context.Context) (metadata.MD, [][]string, bool))
 
 // http2Client implements the ClientTransport interface with HTTP2.
@@ -980,7 +982,7 @@ func (t *http2Client) closeStream(s *Stream, err error, rst bool, rstCode http2.
 }
 
 // Close kicks off the shutdown process of the transport. This should be called
-// only once on a transport. Once it is called, the transport should not be
+// only once on transport. Once it is called, the transport should not be
 // accessed anymore.
 func (t *http2Client) Close(err error) {
 	t.mu.Lock()
@@ -1006,24 +1008,30 @@ func (t *http2Client) Close(err error) {
 		t.kpDormancyCond.Signal()
 	}
 	t.mu.Unlock()
+	var st *status.Status
 	// Per HTTP/2 spec, a GOAWAY frame must be sent before closing the
-	// connection. See https://httpwg.org/specs/rfc7540.html#GOAWAY.
+	// connection. See https://httpwg.org/specs/rfc7540.html#GOAWAY. It
+	// also waits for loopyWriter to be closed with a timer to avoid the
+	// long blocking in case the connection is half closed.
 	t.controlBuf.put(&goAway{code: http2.ErrCodeNo, debugData: []byte("client transport shutdown"), closeConn: err})
-	<-t.writerDone
+	select {
+	case <-t.writerDone:
+		// Append info about previous goaway's if there were any, since this
+		// may be important for understanding the root cause for this
+		// connection to be closed.
+		_, goAwayDebugMessage := t.GetGoAwayReason()
+		if len(goAwayDebugMessage) > 0 {
+			st = status.Newf(codes.Unavailable, "closing transport due to: %v, received prior goaway: %v", err, goAwayDebugMessage)
+			err = st.Err()
+		} else {
+			st = status.New(codes.Unavailable, err.Error())
+		}
+	case <-time.After(goAwayLoopyWriterTimeout):
+		t.logger.Warningf("Failed to write a GOAWAY frame as part of connection close after %v. Giving up and closing the transport.", goAwayLoopyWriterTimeout)
+	}
 	t.cancel()
 	t.conn.Close()
 	channelz.RemoveEntry(t.channelz.ID)
-	// Append info about previous goaways if there were any, since this may be important
-	// for understanding the root cause for this connection to be closed.
-	_, goAwayDebugMessage := t.GetGoAwayReason()
-
-	var st *status.Status
-	if len(goAwayDebugMessage) > 0 {
-		st = status.Newf(codes.Unavailable, "closing transport due to: %v, received prior goaway: %v", err, goAwayDebugMessage)
-		err = st.Err()
-	} else {
-		st = status.New(codes.Unavailable, err.Error())
-	}
 
 	// Notify all active streams.
 	for _, s := range streams {
